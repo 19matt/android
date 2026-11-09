@@ -26,6 +26,10 @@ import io.homeassistant.companion.android.common.data.prefs.ScreenOrientation
 import io.homeassistant.companion.android.common.data.prefs.ZoomSettings
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.util.GestureDirection
+import io.homeassistant.companion.android.database.server.Server
+import io.homeassistant.companion.android.database.server.ServerConnectionInfo
+import io.homeassistant.companion.android.database.server.ServerSessionInfo
+import io.homeassistant.companion.android.database.server.ServerUserInfo
 import io.homeassistant.companion.android.database.authentication.Authentication
 import io.homeassistant.companion.android.database.authentication.AuthenticationDao
 import io.homeassistant.companion.android.frontend.WebViewAction.ApplySafeAreaInsets.Companion.SafeAreaInsets
@@ -200,6 +204,17 @@ class FrontendViewModelTest {
         )
     }
 
+    private fun createServer(
+        externalUrl: String,
+        internalUrl: String? = null,
+    ): Server = Server(
+        id = serverId,
+        _name = "Test server",
+        connection = ServerConnectionInfo(externalUrl = externalUrl, internalUrl = internalUrl),
+        session = ServerSessionInfo(),
+        user = ServerUserInfo(),
+    )
+
     @Nested
     inner class UrlInterception {
 
@@ -325,6 +340,126 @@ class FrontendViewModelTest {
             val state = assertInstanceOf(FrontendViewState.Loading::class.java, viewModel.viewState.value)
             assertEquals(serverId, state.serverId)
             assertEquals(testUrlWithAuth, state.url)
+        }
+
+        @Test
+        fun `Given same-origin api media url when initialized then content is exposed immediately and later errors remain visible`() = runTest {
+            val mediaUrl = "https://example.com/api/camera_proxy/camera.front_door?external_auth=1"
+            val server = createServer(externalUrl = "https://example.com")
+            coEvery { serverManager.getServer(serverId) } returns server
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.Success(url = mediaUrl, serverId = serverId, isApiOrLocalResource = true),
+            )
+
+            var onFrontendError: ((FrontendConnectionError) -> Unit)? = null
+            coEvery {
+                webViewClientFactory.create(
+                    currentUrlFlow = any(),
+                    onFrontendError = any(),
+                    onCrash = any(),
+                    onUrlIntercepted = any(),
+                    onPageFinished = any(),
+                    onReceivedHttpAuthRequest = any(),
+                    onCanGoBackChanged = any(),
+                    onSubresourceSslError = any(),
+                )
+            } answers {
+                onFrontendError = arg(1)
+                mockk(relaxed = true)
+            }
+
+            val viewModel = createViewModel()
+            viewModel.getWebViewClient()
+            runCurrent()
+
+            val exposedState = assertInstanceOf(FrontendViewState.Content::class.java, viewModel.viewState.value)
+            assertEquals(mediaUrl, exposedState.url)
+
+            onFrontendError?.invoke(
+                FrontendConnectionError.Unreachable(
+                    message = commonR.string.webview_error_HOST_LOOKUP,
+                    errorDetails = "camera resource host lookup failed",
+                    rawErrorType = "WebResourceError",
+                ),
+            )
+            advanceUntilIdle()
+
+            val errorState = assertInstanceOf(FrontendViewState.Error::class.java, viewModel.viewState.value)
+            assertInstanceOf(FrontendConnectionError.Unreachable::class.java, errorState.error)
+        }
+
+        @Test
+        fun `Given api media url under configured server path when initialized then content is exposed immediately`() = runTest {
+            val mediaUrl = "https://example.com/ha/api/camera_proxy/camera.front_door?external_auth=1"
+            val server = createServer(
+                externalUrl = "https://example.com/ha",
+                internalUrl = "https://example.com/ha/api",
+            )
+            coEvery { serverManager.getServer(serverId) } returns server
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.Success(url = mediaUrl, serverId = serverId, isApiOrLocalResource = true),
+            )
+
+            val viewModel = createViewModel()
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Content::class.java, viewModel.viewState.value)
+            assertEquals(mediaUrl, state.url)
+        }
+
+        @Test
+        fun `Given same-origin local media url when initialized then content is exposed immediately`() = runTest {
+            val mediaUrl = "https://example.com/local/media/door.mp4?external_auth=1"
+            val server = createServer(externalUrl = "https://example.com")
+            coEvery { serverManager.getServer(serverId) } returns server
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.Success(url = mediaUrl, serverId = serverId, isApiOrLocalResource = true),
+            )
+
+            val viewModel = createViewModel()
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Content::class.java, viewModel.viewState.value)
+            assertEquals(mediaUrl, state.url)
+        }
+
+        @ParameterizedTest
+        @ValueSource(
+            strings = [
+                "https://example.com/apiary/camera",
+                "https://example.com/locality/clip",
+                "https://example.com/dashboard/api/clip",
+                "https://outside.example/api/camera",
+            ],
+        )
+        fun `Given url outside the exact server api or local first segment when initialized then content stays loading`(url: String) = runTest {
+            val server = createServer(externalUrl = "https://example.com")
+            coEvery { serverManager.getServer(serverId) } returns server
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.Success(url = url, serverId = serverId),
+            )
+
+            val viewModel = createViewModel()
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Loading::class.java, viewModel.viewState.value)
+            assertEquals(url, state.url)
+        }
+
+        @Test
+        fun `Given api resource success from an unconfigured origin when initialized then content stays loading`() = runTest {
+            val url = "https://outside.example/api/camera"
+            val server = createServer(externalUrl = "https://example.com")
+            coEvery { serverManager.getServer(serverId) } returns server
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.Success(url = url, serverId = serverId, isApiOrLocalResource = true),
+            )
+
+            val viewModel = createViewModel()
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Loading::class.java, viewModel.viewState.value)
+            assertEquals(url, state.url)
         }
 
         @Test

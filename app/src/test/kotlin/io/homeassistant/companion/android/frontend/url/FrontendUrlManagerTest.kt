@@ -109,6 +109,41 @@ class FrontendUrlManagerTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource(
+        "/api/camera,true",
+        "/local/camera,true",
+        "/apiary/camera,false",
+        "/dashboard/api/camera,false",
+    )
+    fun `Given selected base URL and overlapping configured paths when resolving target then marks only exact api or local segment`(
+        path: String,
+        expectedIsApiOrLocalResource: Boolean,
+    ) = runTest {
+        val server = createTestServer(
+            id = 1,
+            connectionInfo = ServerConnectionInfo(
+                externalUrl = "https://home.example.com/ha",
+                internalUrl = "https://home.example.com/ha/api",
+            ),
+        )
+        coEvery { serverManager.getServer(1) } returns server
+        coEvery { sessionManager.isSessionConnected(1) } returns true
+        coEvery { serverManager.activateServer(1) } just runs
+        coEvery { serverManager.connectionStateProvider(1) } returns connectionStateProvider
+        every { connectionStateProvider.urlFlow(null) } returns flowOf(
+            UrlState.HasUrl(URL("https://home.example.com/ha")),
+        )
+
+        urlManager.serverUrlFlow(serverId = 1, target = FrontendTarget.Path(path)).test {
+            val result = awaitItem() as UrlLoadResult.Success
+
+            assertEquals("https://home.example.com/ha${path}?external_auth=1", result.url)
+            assertEquals(expectedIsApiOrLocalResource, result.isApiOrLocalResource)
+            awaitComplete()
+        }
+    }
+
     @Test
     fun `Given EntityMoreInfo on HA 2025_6+ when serverUrlFlow then loads more-info-entity-id query`() = runTest {
         val server = createTestServer(id = 1, externalUrl = "https://home.example.com", version = "2025.6.0")

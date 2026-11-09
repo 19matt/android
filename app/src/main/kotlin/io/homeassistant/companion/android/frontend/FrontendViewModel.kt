@@ -1032,6 +1032,15 @@ internal class FrontendViewModel @VisibleForTesting constructor(
                         target = currentState.pendingTarget,
                     )
                 }
+                if (result.isApiOrLocalResource) {
+                    val server = serverManager.getServer(result.serverId)
+                    if (server?.connection?.isFrontendUrl(result.url) == true) {
+                        // Option 3 exposes eligible media URLs before the frontend bus handshake. The
+                        // page can be blank or partial if the URL does not return renderable media;
+                        // subsequent WebView connection errors still replace Content with Error.
+                        showContent()
+                    }
+                }
             }
 
             is UrlLoadResult.ServerNotFound -> {
