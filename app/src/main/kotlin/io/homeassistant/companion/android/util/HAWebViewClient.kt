@@ -22,6 +22,7 @@ import io.homeassistant.companion.android.frontend.error.FrontendConnectionError
 import java.lang.ref.WeakReference
 import javax.inject.Inject
 import kotlinx.coroutines.flow.StateFlow
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import timber.log.Timber
 
 @VisibleForTesting
@@ -127,6 +128,15 @@ class HAWebViewClient internal constructor(
     private var lastResourceUrl: String? = null
 
     /**
+     * Current main-frame URL tracked separately from [currentUrlFlow], which remains the initial
+     * server URL across in-page navigation and redirects.
+     */
+    private var currentMainFrameUrl: String? = null
+
+    /** The server URL associated with [currentMainFrameUrl], used to reset it after server switches. */
+    private var mainFrameServerUrl: String? = null
+
+    /**
      * Weak reference to the WebView already reporting history changes. This client outlives the WebViews
      * recreated by the screen, so a new WebView is detected and observed as well.
      */
@@ -134,6 +144,11 @@ class HAWebViewClient internal constructor(
 
     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
         super.onPageStarted(view, url, favicon)
+        syncMainFrameUrlToServerUrl()
+        if (url != null && isSameOriginWithServerUrl(url)) {
+            currentMainFrameUrl = url
+        }
+
         val onCanGoBackChanged = onCanGoBackChanged
         if (view != null && onCanGoBackChanged != null && historyObservedWebView?.get() !== view) {
             historyObservedWebView = WeakReference(view)
@@ -173,8 +188,9 @@ class HAWebViewClient internal constructor(
     override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
         super.onReceivedError(view, request, error)
 
-        // Only handle errors for the main URL being loaded
-        if (request?.url?.toString() != currentUrlFlow.value) return
+        // Match the tracked main-frame URL, including a same-origin redirect, without accepting
+        // stale failures from a previous path or errors from subresources.
+        if (!isCurrentMainFrameRequest(request)) return
 
         val errorDetails = formatErrorDetails(
             view?.context,
@@ -240,8 +256,9 @@ class HAWebViewClient internal constructor(
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
 
-        // Only handle errors for the main URL being loaded
-        if (request?.url?.toString() != currentUrlFlow.value) return
+        // Match the tracked main-frame URL, including a same-origin redirect, without accepting
+        // stale failures from a previous path or errors from subresources.
+        if (!isCurrentMainFrameRequest(request)) return
 
         val errorDetails = formatErrorDetails(
             view?.context,
@@ -271,12 +288,13 @@ class HAWebViewClient internal constructor(
 
     override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
         super.onReceivedSslError(view, handler, error)
+        syncMainFrameUrlToServerUrl()
 
         // Only fail the connection for the main URL being loaded. An SSL error on any other resource
         // the page pulls in (a third party script, an image, ...) must not block a working frontend.
         // The call to super already cancelled the handshake, so the resource simply won't load.
         val resourceUrl: String? = error?.url
-        if (error != null && resourceUrl != currentUrlFlow.value) {
+        if (error != null && resourceUrl != currentMainFrameUrl) {
             Timber.w("Ignoring SSL error on subresource ${sensitive(resourceUrl.orEmpty())}: $error")
             onSubresourceSslError?.invoke(resourceUrl)
             return
@@ -309,7 +327,32 @@ class HAWebViewClient internal constructor(
     }
 
     override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-        return request?.url?.let { onUrlIntercepted?.invoke(it, isTLSClientAuthNeeded) } ?: false
+        syncMainFrameUrlToServerUrl()
+        val intercepted = request?.url?.let { onUrlIntercepted?.invoke(it, isTLSClientAuthNeeded) } ?: false
+        if (!intercepted && request?.isForMainFrame == true) {
+            val url = request.url.toString()
+            if (isSameOriginWithServerUrl(url)) currentMainFrameUrl = url
+        }
+        return intercepted
+    }
+
+    private fun syncMainFrameUrlToServerUrl() {
+        val serverUrl = currentUrlFlow.value
+        if (serverUrl != mainFrameServerUrl) {
+            mainFrameServerUrl = serverUrl
+            currentMainFrameUrl = serverUrl
+        }
+    }
+
+    private fun isCurrentMainFrameRequest(request: WebResourceRequest?): Boolean {
+        syncMainFrameUrlToServerUrl()
+        return request?.isForMainFrame == true && request.url.toString() == currentMainFrameUrl
+    }
+
+    private fun isSameOriginWithServerUrl(url: String): Boolean {
+        val requestUrl = url.toHttpUrlOrNull() ?: return false
+        val serverUrl = currentUrlFlow.value?.toHttpUrlOrNull() ?: return false
+        return requestUrl.hasSameOrigin(serverUrl)
     }
 
     private fun formatErrorDetails(context: Context?, code: Int?, description: String?): String {

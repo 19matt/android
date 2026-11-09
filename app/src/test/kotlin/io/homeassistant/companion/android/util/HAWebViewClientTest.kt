@@ -226,6 +226,161 @@ class HAWebViewClientTest {
     }
 
     @Test
+    fun `Given same-origin main-frame redirect when redirected URL returns HTTP error then emits error`() {
+        val webView = mockWebView()
+        val initialUrl = "https://homeassistant.local:8123/ha/api/camera?external_auth=1"
+        val redirectedUrl = "https://homeassistant.local:8123/ha/api/camera/stream"
+        currentUrlFlow.value = initialUrl
+        webViewClient.onPageStarted(webView, initialUrl, null)
+
+        val redirectRequest = mockRequest(redirectedUrl, isForMainFrame = true, isRedirect = true)
+        assertEquals(false, webViewClient.shouldOverrideUrlLoading(webView, redirectRequest))
+
+        val response = mockk<WebResourceResponse> {
+            every { statusCode } returns 404
+            every { reasonPhrase } returns "Not Found"
+        }
+        webViewClient.onReceivedHttpError(
+            webView,
+            mockRequest(redirectedUrl, isForMainFrame = true, isRedirect = true),
+            response,
+        )
+
+        assertFrontendError<FrontendConnectionError.Unknown>(
+            commonR.string.connection_error_unknown_error,
+            errorDetails(404, "Not Found"),
+            WebResourceResponse::class,
+        )
+    }
+
+    @Test
+    fun `Given same-origin main-frame redirect when redirected URL has network error then emits error`() {
+        val webView = mockWebView()
+        val initialUrl = "https://homeassistant.local:8123/ha/api/camera?external_auth=1"
+        val redirectedUrl = "https://homeassistant.local:8123/ha/api/camera/stream"
+        currentUrlFlow.value = initialUrl
+        webViewClient.onPageStarted(webView, initialUrl, null)
+
+        val redirectRequest = mockRequest(redirectedUrl, isForMainFrame = true, isRedirect = true)
+        assertEquals(false, webViewClient.shouldOverrideUrlLoading(webView, redirectRequest))
+
+        val error = mockk<WebResourceError> {
+            every { errorCode } returns ERROR_HOST_LOOKUP
+            every { description } returns "Host lookup failed"
+        }
+        webViewClient.onReceivedError(
+            webView,
+            mockRequest(redirectedUrl, isForMainFrame = true, isRedirect = true),
+            error,
+        )
+
+        assertFrontendError<FrontendConnectionError.Unreachable>(
+            commonR.string.webview_error_HOST_LOOKUP,
+            errorDetails(ERROR_HOST_LOOKUP, "Host lookup failed"),
+            WebResourceError::class,
+        )
+    }
+
+    @Test
+    fun `Given same-origin main-frame redirect when redirected URL has SSL error then emits SSL error`() {
+        val initialUrl = "https://homeassistant.local:8123/ha/api/camera?external_auth=1"
+        val redirectedUrl = "https://homeassistant.local:8123/ha/api/camera/stream"
+        currentUrlFlow.value = initialUrl
+        webViewClient.onPageStarted(null, initialUrl, null)
+
+        val redirectRequest = mockRequest(redirectedUrl, isForMainFrame = true, isRedirect = true)
+        assertEquals(false, webViewClient.shouldOverrideUrlLoading(null, redirectRequest))
+
+        webViewClient.onReceivedSslError(
+            null,
+            null,
+            mockSslError(SslError.SSL_UNTRUSTED, url = redirectedUrl),
+        )
+
+        assertFrontendError<FrontendConnectionError.SslError>(
+            commonR.string.webview_error_SSL_UNTRUSTED,
+            "SSL Error: ${SslError.SSL_UNTRUSTED}",
+            SslError::class,
+        )
+        assertTrue(subresourceSslErrorUrls.isEmpty())
+    }
+
+    @Test
+    fun `Given a new same-origin main frame page when prior page error arrives then ignores stale error`() {
+        val webView = mockWebView()
+        val previousUrl = "https://homeassistant.local:8123/ha/api/camera?external_auth=1"
+        val currentUrl = "https://homeassistant.local:8123/ha/lovelace/0"
+        currentUrlFlow.value = previousUrl
+        webViewClient.onPageStarted(webView, previousUrl, null)
+        val currentRequest = mockRequest(currentUrl, isForMainFrame = true)
+        assertEquals(false, webViewClient.shouldOverrideUrlLoading(webView, currentRequest))
+        webViewClient.onPageStarted(webView, currentUrl, null)
+
+        val response = mockk<WebResourceResponse> {
+            every { statusCode } returns 404
+            every { reasonPhrase } returns "Not Found"
+        }
+        webViewClient.onReceivedHttpError(
+            webView,
+            mockRequest(previousUrl, isForMainFrame = true),
+            response,
+        )
+
+        assertEquals(null, capturedError)
+    }
+
+    @Test
+    fun `Given browser back to an earlier same-origin page when it errors then emits error`() {
+        val webView = mockWebView()
+        val initialUrl = "https://homeassistant.local:8123/ha/"
+        val pageA = "https://homeassistant.local:8123/ha/lovelace/0"
+        val pageB = "https://homeassistant.local:8123/ha/lovelace/1"
+        currentUrlFlow.value = initialUrl
+        webViewClient.onPageStarted(webView, initialUrl, null)
+
+        assertEquals(false, webViewClient.shouldOverrideUrlLoading(webView, mockRequest(pageA)))
+        webViewClient.onPageStarted(webView, pageA, null)
+        assertEquals(false, webViewClient.shouldOverrideUrlLoading(webView, mockRequest(pageB)))
+        webViewClient.onPageStarted(webView, pageB, null)
+
+        // A history traversal can report onPageStarted without a corresponding shouldOverride callback.
+        webViewClient.onPageStarted(webView, pageA, null)
+        val error = mockk<WebResourceError> {
+            every { errorCode } returns ERROR_HOST_LOOKUP
+            every { description } returns "Host lookup failed"
+        }
+        webViewClient.onReceivedError(webView, mockRequest(pageA), error)
+
+        assertFrontendError<FrontendConnectionError.Unreachable>(
+            commonR.string.webview_error_HOST_LOOKUP,
+            errorDetails(ERROR_HOST_LOOKUP, "Host lookup failed"),
+            WebResourceError::class,
+        )
+    }
+
+    @Test
+    fun `Given same-origin subresource HTTP error when page is loaded then ignores it`() {
+        val webView = mockWebView()
+        val mainFrameUrl = "https://homeassistant.local:8123/ha/api/camera?external_auth=1"
+        currentUrlFlow.value = mainFrameUrl
+
+        val response = mockk<WebResourceResponse> {
+            every { statusCode } returns 404
+            every { reasonPhrase } returns "Not Found"
+        }
+        webViewClient.onReceivedHttpError(
+            webView,
+            mockRequest(
+                "https://homeassistant.local:8123/ha/static/missing.js",
+                isForMainFrame = false,
+            ),
+            response,
+        )
+
+        assertEquals(null, capturedError)
+    }
+
+    @Test
     fun `Given HTTP error without reason when onReceivedHttpError then emits Unknown with no description`() {
         val webView = mockWebView()
         val currentUrl = "http://homeassistant.local:8123/auth/authorize"
@@ -573,9 +728,15 @@ class HAWebViewClientTest {
         }
     }
 
-    private fun mockRequest(url: String) = mockk<android.webkit.WebResourceRequest> {
+    private fun mockRequest(
+        url: String,
+        isForMainFrame: Boolean = true,
+        isRedirect: Boolean = false,
+    ) = mockk<android.webkit.WebResourceRequest> {
         every { this@mockk.url } returns mockk {
             every { this@mockk.toString() } returns url
         }
+        every { this@mockk.isForMainFrame } returns isForMainFrame
+        every { this@mockk.isRedirect } returns isRedirect
     }
 }

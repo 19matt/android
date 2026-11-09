@@ -17,6 +17,21 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import timber.log.Timber
 
 private const val MORE_INFO_ENTITY_ID_QUERY_PARAM = "more-info-entity-id"
+private val API_OR_LOCAL_PATH_SEGMENTS = setOf("api", "local")
+
+/**
+ * Checks whether this URL starts with an exact `api` or `local` segment after [baseUrl]'s path.
+ */
+private fun HttpUrl.isApiOrLocalResource(baseUrl: HttpUrl): Boolean {
+    if (!hasSameOrigin(baseUrl)) return false
+
+    val basePathSegments = baseUrl.encodedPathSegments.dropLastWhile { it.isEmpty() }
+    val targetPathSegments = encodedPathSegments
+    if (targetPathSegments.take(basePathSegments.size) != basePathSegments) return false
+
+    val firstTargetSegment = targetPathSegments.getOrNull(basePathSegments.size) ?: return false
+    return firstTargetSegment in API_OR_LOCAL_PATH_SEGMENTS
+}
 
 /**
  * Manages URL resolution and security checks for the frontend.
@@ -138,6 +153,7 @@ class FrontendUrlManager @Inject constructor(
                     url = urlWithAuth,
                     serverId = serverId,
                     moreInfoEntityId = resolved.moreInfoEntityIdForJs,
+                    isApiOrLocalResource = url.isApiOrLocalResource(baseUrl),
                 )
             }
         }
