@@ -138,9 +138,41 @@ class FrontendUrlManager @Inject constructor(
                     url = urlWithAuth,
                     serverId = serverId,
                     moreInfoEntityId = resolved.moreInfoEntityIdForJs,
+                    isStandaloneResourceTarget = isStandaloneResourceTarget(target, baseUrl),
                 )
             }
         }
+    }
+
+    /**
+     * Classifies API/local paths while the selected server base URL is available. Absolute targets
+     * may include the configured base path, so inspect the first segment after that prefix instead
+     * of scanning arbitrary nested paths for an `api` or `local` segment.
+     */
+    private fun isStandaloneResourceTarget(target: FrontendTarget, baseUrl: HttpUrl?): Boolean {
+        val path = (target as? FrontendTarget.Path)?.path
+        val absoluteTarget = path?.toHttpUrlOrNull()
+        val resourcePathSegments = when {
+            path == null -> emptyList()
+            absoluteTarget != null && baseUrl != null && absoluteTarget.hasSameOrigin(baseUrl) -> {
+                val targetSegments = absoluteTarget.encodedPathSegments.filter(String::isNotEmpty)
+                val basePathSegments = baseUrl.encodedPathSegments.filter(String::isNotEmpty)
+                if (targetSegments.take(basePathSegments.size) == basePathSegments) {
+                    targetSegments.drop(basePathSegments.size)
+                } else {
+                    targetSegments
+                }
+            }
+            absoluteTarget != null -> emptyList()
+            else -> {
+                path.substringBefore('?')
+                    .substringBefore('#')
+                    .removePrefix("/")
+                    .substringBefore('/')
+                    .let(::listOf)
+            }
+        }
+        return resourcePathSegments.firstOrNull() in setOf("api", "local")
     }
 
     /**

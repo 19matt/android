@@ -1176,6 +1176,10 @@ class FrontendViewModelTest {
         private suspend fun createViewModelWithLoadCallbacks(
             url: String,
             path: String = url.substringAfter(".com"),
+            standaloneResourceTarget: Boolean = path.substringBefore('?')
+                .substringBefore('#')
+                .removePrefix("/")
+                .substringBefore('/') in setOf("api", "local"),
         ): Triple<FrontendViewModel, (String?, String?) -> Unit, (FrontendConnectionError) -> Unit> {
             var onStandaloneResourceReady: ((String?, String?) -> Unit)? = null
             var onFrontendError: ((FrontendConnectionError) -> Unit)? = null
@@ -1198,7 +1202,11 @@ class FrontendViewModelTest {
                 mockk(relaxed = true)
             }
             every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
-                UrlLoadResult.Success(url = url, serverId = serverId),
+                UrlLoadResult.Success(
+                    url = url,
+                    serverId = serverId,
+                    isStandaloneResourceTarget = standaloneResourceTarget,
+                ),
             )
 
             val viewModel = createViewModel(path = path)
@@ -1237,6 +1245,37 @@ class FrontendViewModelTest {
 
             val state = assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
             assertEquals(selectedUrl, state.url)
+        }
+
+        @ParameterizedTest
+        @ValueSource(
+            strings = [
+                "https://ha.example.com/ha/api/states",
+                "https://ha.example.com/ha/local/media/camera.mp4",
+            ],
+        )
+        fun `Given same-origin absolute api or local target with a configured base path when ready then show content`(target: String) = runTest {
+            val selectedUrl = "$target?external_auth=1"
+            val callbacks = createViewModelWithLoadCallbacks(selectedUrl, target, standaloneResourceTarget = true)
+            runCurrent()
+
+            callbacks.second(selectedUrl, selectedUrl)
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+            assertEquals(selectedUrl, state.url)
+        }
+
+        @Test
+        fun `Given absolute nested api path outside configured base when ready then keep loading`() = runTest {
+            val target = "https://ha.example.com/foo/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(target, target, standaloneResourceTarget = false)
+            runCurrent()
+
+            callbacks.second(target, target)
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Loading::class.java, callbacks.first.viewState.value)
         }
 
         @ParameterizedTest
@@ -1448,7 +1487,13 @@ class FrontendViewModelTest {
             val viewModel = createViewModel(path = "/api/old")
             viewModel.getWebViewClient()
             runCurrent()
-            results.emit(UrlLoadResult.Success(url = currentUrl, serverId = serverId + 1))
+            results.emit(
+                UrlLoadResult.Success(
+                    url = currentUrl,
+                    serverId = serverId + 1,
+                    isStandaloneResourceTarget = true,
+                ),
+            )
             runCurrent()
 
             onStandaloneResourceReady!!.invoke(currentUrl, currentUrl)

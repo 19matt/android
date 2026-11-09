@@ -170,10 +170,7 @@ private fun standaloneResponseResult(evaluationResult: String?): Boolean? {
     }
 }
 
-private fun isEligibleStandaloneDocument(
-    mime: String,
-    result: kotlinx.serialization.json.JsonObject,
-): Boolean {
+private fun isEligibleStandaloneDocument(mime: String, result: kotlinx.serialization.json.JsonObject): Boolean {
     val isHtmlDocument = result["html"]?.jsonPrimitive?.booleanOrNull == true ||
         mime == "text/html" ||
         mime == "application/xhtml+xml"
@@ -374,7 +371,8 @@ class HAWebViewClient internal constructor(
                                     webView = webView,
                                     startedUrl = mainFrameStartedUrl,
                                     selectedUrl = currentUrlFlow.value,
-                                    isStandaloneTarget = isStandaloneResourceTarget?.invoke(currentUrlFlow.value) == true,
+                                    isStandaloneTarget =
+                                    isStandaloneResourceTarget?.invoke(currentUrlFlow.value) == true,
                                     currentPageUrl = webView.url,
                                     finishedUrl = finishedUrl,
                                 ),
@@ -607,7 +605,6 @@ class HAWebViewClient internal constructor(
                 ?: context.getString(commonR.string.no_description),
         ) ?: ""
     }
-
 }
 
 /**

@@ -425,6 +425,7 @@ class FrontendUrlManagerTest {
         "https://example.com/, https://example.com/",
         "http://home.example.com/dashboard, http://home.example.com/dashboard",
         "https://home.example.com:8123/dashboard, https://home.example.com:8123/dashboard",
+        "https://other.example.com/api/states, https://other.example.com/api/states",
     )
     fun `Given absolute target outside the server origin when serverUrlFlow then returns ExternalUrl`(
         target: String,
@@ -452,6 +453,26 @@ class FrontendUrlManagerTest {
                 UrlLoadResult.Success(url = "https://home.example.com/dashboard?external_auth=1", serverId = 1),
                 awaitItem(),
             )
+            awaitComplete()
+        }
+    }
+
+    @ParameterizedTest(name = "{0} -> standalone={2}")
+    @CsvSource(
+        "https://home.example.com/ha, https://home.example.com/ha/api/states, true",
+        "https://home.example.com, https://home.example.com/foo/api/states, false",
+        "https://home.example.com, https://home.example.com/api/states, true",
+    )
+    fun `Given absolute target when serverUrlFlow then classifies standalone path relative to configured base`(
+        baseUrl: String,
+        target: String,
+        expectedStandalone: Boolean,
+    ) = runTest {
+        givenConnectedServer(baseUrl = URL(baseUrl))
+
+        urlManager.serverUrlFlow(serverId = 1, target = FrontendTarget.Path(target)).test {
+            val success = awaitItem() as UrlLoadResult.Success
+            assertEquals(expectedStandalone, success.isStandaloneResourceTarget)
             awaitComplete()
         }
     }

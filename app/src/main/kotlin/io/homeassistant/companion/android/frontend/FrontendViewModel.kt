@@ -387,6 +387,7 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     /** Selected URL whose native WebView error arrived before its asynchronous state update. */
     private var failedStandaloneResourceUrl: String? = null
     private var selectedFrontendTarget: FrontendTarget = FrontendTarget.Default
+    private var selectedIsStandaloneResourceTarget: Boolean = false
 
     /** Job tracking the zoom settings flow collection - restarted on each page load. */
     private var zoomObserverJob: Job? = null
@@ -873,6 +874,7 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     }
 
     private fun startLoad(serverId: Int = _viewState.value.serverId, target: FrontendTarget = FrontendTarget.Default) {
+        selectedIsStandaloneResourceTarget = false
         _viewState.update { FrontendViewState.LoadServer(serverId = serverId, target = target) }
     }
 
@@ -1050,6 +1052,7 @@ internal class FrontendViewModel @VisibleForTesting constructor(
             is UrlLoadResult.Success -> {
                 failedStandaloneResourceUrl = null
                 selectedFrontendTarget = _viewState.value.pendingTarget
+                selectedIsStandaloneResourceTarget = result.isStandaloneResourceTarget
                 pendingMoreInfoEntityId = result.moreInfoEntityId
                 _viewState.update { currentState ->
                     FrontendViewState.Loading(
@@ -1366,19 +1369,10 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         return state.takeIf { hasValidNavigation }
     }
 
-    /**
-     * Uses the selected relative target, not the resolved URL path: configured HA base URLs may
-     * include a prefix such as `/ha`, which remains before `/api` or `/local` after resolution.
-     */
+    /** Uses the classification made during URL resolution, when the configured server base path is known. */
     private fun isStandaloneResourceTarget(selectedUrl: String?): Boolean {
         val state = _viewState.value
-        val target = (state as? FrontendViewState.Loading)?.target ?: selectedFrontendTarget
-        val firstSegment = (target as? FrontendTarget.Path)?.path
-            ?.substringBefore('?')
-            ?.substringBefore('#')
-            ?.removePrefix("/")
-            ?.substringBefore('/')
-        return state.url == selectedUrl && firstSegment in setOf("api", "local")
+        return state.url == selectedUrl && selectedIsStandaloneResourceTarget
     }
 
     private fun FrontendViewState.matchesReadinessState(expected: FrontendViewState): Boolean {
