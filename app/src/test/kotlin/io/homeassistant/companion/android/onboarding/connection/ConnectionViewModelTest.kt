@@ -631,6 +631,7 @@ class ConnectionViewModelTest {
         assertNotNull(authUrl)
 
         val request = mockk<WebResourceRequest> {
+            every { isForMainFrame } returns true
             every { url } returns mockk<Uri> {
                 every { this@mockk.toString() } returns authUrl
             }

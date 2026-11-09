@@ -214,6 +214,15 @@ internal class FrontendViewModel @VisibleForTesting constructor(
                 transform(currentState)
             }
         }
+
+        fun compareAndSet(expect: FrontendViewState, update: FrontendViewState): Boolean {
+            if (_state.value is FrontendViewState.Error &&
+                (_state.value as FrontendViewState.Error).error is FrontendConnectionError.Unrecoverable
+            ) {
+                return false
+            }
+            return _state.compareAndSet(expect, update)
+        }
     }
 
     private val _viewState = ViewStateManager(
@@ -267,7 +276,16 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private val webViewClient = SuspendLazy {
         webViewClientFactory.create(
             currentUrlFlow = urlFlow,
-            onFrontendError = ::onError,
+            onFrontendError = { error ->
+                val currentState = _viewState.value
+                if (currentState is FrontendViewState.Loading ||
+                    currentState is FrontendViewState.Error &&
+                    currentState.error == FrontendConnectionError.ExternalBusTimeout
+                ) {
+                    failedStandaloneResourceUrl = currentState.url
+                }
+                onError(error)
+            },
             onCrash = ::onRetry,
             onPageFinished = ::onPageFinished,
             onUrlIntercepted = { uri, _ -> onUrlIntercepted(uri) },
@@ -302,6 +320,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
                     },
                 )
             },
+            onStandaloneResourceReady = ::onStandaloneResourceReady,
+            isStandaloneResourceTarget = ::isStandaloneResourceTarget,
         )
     }
 
@@ -363,6 +383,10 @@ internal class FrontendViewModel @VisibleForTesting constructor(
 
     /** Job tracking the urlFlow collection - cancelled when switching servers. */
     private var urlFlowJob: Job? = null
+
+    /** Selected URL whose native WebView error arrived before its asynchronous state update. */
+    private var failedStandaloneResourceUrl: String? = null
+    private var selectedFrontendTarget: FrontendTarget = FrontendTarget.Default
 
     /** Job tracking the zoom settings flow collection - restarted on each page load. */
     private var zoomObserverJob: Job? = null
@@ -844,7 +868,7 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         if (state.connected) {
             showContent()
         } else {
-            onError(FrontendConnectionError.ExternalBusTimeout)
+            onError(FrontendConnectionError.ExternalBusTimeout, expectedState = state)
         }
     }
 
@@ -1024,6 +1048,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private suspend fun handleUrlResult(result: UrlLoadResult) {
         when (result) {
             is UrlLoadResult.Success -> {
+                failedStandaloneResourceUrl = null
+                selectedFrontendTarget = _viewState.value.pendingTarget
                 pendingMoreInfoEntityId = result.moreInfoEntityId
                 _viewState.update { currentState ->
                     FrontendViewState.Loading(
@@ -1156,21 +1182,35 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         else -> this::class.simpleName.orEmpty()
     }
 
-    private fun onError(error: FrontendConnectionError) {
+    private fun onError(error: FrontendConnectionError, expectedState: FrontendViewState? = null) {
         Timber.w("Frontend error: ${error::class.simpleName}")
         // Resolve the connection type so the error screen can label the "Refresh" action, then
         // build the recovery actions for the screen to render.
         viewModelScope.launch {
-            val serverId = _viewState.value.serverId
+            val initialState = _viewState.value
+            if (expectedState != null && initialState != expectedState) return@launch
+            val serverId = initialState.serverId
             val isInternal = resolveIsInternalConnection(serverId)
             val actions = errorActions(error, isInternalConnection = isInternal)
-            _viewState.update { currentState ->
-                FrontendViewState.Error(
-                    serverId = currentState.serverId,
-                    url = currentState.url,
-                    error = error,
-                    actions = actions,
-                )
+            val errorState = FrontendViewState.Error(
+                serverId = initialState.serverId,
+                url = initialState.url,
+                error = error,
+                actions = actions,
+            )
+            if (expectedState == null) {
+                _viewState.update { currentState ->
+                    FrontendViewState.Error(
+                        serverId = currentState.serverId,
+                        url = currentState.url,
+                        error = error,
+                        actions = actions,
+                    )
+                }
+            } else {
+                // Error classification suspends. A timeout that began while Loading must not
+                // replace Content or a newer error after readiness/native callbacks win the race.
+                _viewState.compareAndSet(expectedState, errorState)
             }
         }
         // Automatically run connectivity checks when an error occurs
@@ -1299,23 +1339,92 @@ internal class FrontendViewModel @VisibleForTesting constructor(
      * frontend theme and checking the notification permission once the content is visible.
      * No-op on the state when the content is already shown.
      */
-    private suspend fun showContent() {
-        val wasAwaitingConnection = _viewState.value.isAwaitingConnection()
-        val serverHandleInsets = serverHandlesInsets(_viewState.value.serverId)
-        val serverHandleTopInsets = serverHandlesTopInsets(_viewState.value.serverId)
-        _viewState.update { currentState ->
-            if (currentState.isAwaitingConnection()) {
-                FrontendViewState.Content(
-                    serverId = currentState.serverId,
-                    url = currentState.url,
-                    serverHandleInsets = serverHandleInsets,
-                    serverHandleTopInsets = serverHandleTopInsets,
-                )
-            } else {
-                currentState
+    private fun onStandaloneResourceReady(startedUrl: String?, finishedUrl: String?) {
+        standaloneReadinessState(startedUrl, finishedUrl)?.let { readinessState ->
+            viewModelScope.launch { showContent(expectedReadinessState = readinessState) }
+        }
+    }
+
+    private fun standaloneReadinessState(startedUrl: String?, finishedUrl: String?): FrontendViewState? {
+        val state = _viewState.value
+        val target = when (state) {
+            is FrontendViewState.Loading -> state.target
+            is FrontendViewState.Error -> selectedFrontendTarget.takeIf {
+                state.error == FrontendConnectionError.ExternalBusTimeout
+            }
+            else -> null
+        }
+        val selectedUrl = state.url.toHttpUrlOrNull()
+        val finalUrl = finishedUrl?.toHttpUrlOrNull()
+        val hasValidNavigation = target is FrontendTarget.Path &&
+            isStandaloneResourceTarget(state.url) &&
+            failedStandaloneResourceUrl != state.url &&
+            startedUrl == state.url &&
+            selectedUrl != null &&
+            finalUrl != null &&
+            selectedUrl.hasSameOrigin(finalUrl)
+        return state.takeIf { hasValidNavigation }
+    }
+
+    /**
+     * Uses the selected relative target, not the resolved URL path: configured HA base URLs may
+     * include a prefix such as `/ha`, which remains before `/api` or `/local` after resolution.
+     */
+    private fun isStandaloneResourceTarget(selectedUrl: String?): Boolean {
+        val state = _viewState.value
+        val target = (state as? FrontendViewState.Loading)?.target ?: selectedFrontendTarget
+        val firstSegment = (target as? FrontendTarget.Path)?.path
+            ?.substringBefore('?')
+            ?.substringBefore('#')
+            ?.removePrefix("/")
+            ?.substringBefore('/')
+        return state.url == selectedUrl && firstSegment in setOf("api", "local")
+    }
+
+    private fun FrontendViewState.matchesReadinessState(expected: FrontendViewState): Boolean {
+        if (failedStandaloneResourceUrl == expected.url) return false
+        return when (expected) {
+            is FrontendViewState.Loading ->
+                this is FrontendViewState.Loading &&
+                    serverId == expected.serverId &&
+                    url == expected.url &&
+                    target == expected.target
+            is FrontendViewState.Error ->
+                this is FrontendViewState.Error &&
+                    serverId == expected.serverId &&
+                    url == expected.url &&
+                    error == FrontendConnectionError.ExternalBusTimeout
+            else -> false
+        }
+    }
+
+    private suspend fun showContent(expectedReadinessState: FrontendViewState? = null) {
+        val initialState = _viewState.value
+        if (expectedReadinessState != null && !initialState.matchesReadinessState(expectedReadinessState)) return
+        val wasAwaitingConnection = initialState.isAwaitingConnection()
+        val serverHandleInsets = serverHandlesInsets(initialState.serverId)
+        val serverHandleTopInsets = serverHandlesTopInsets(initialState.serverId)
+        var transitioned = false
+        while (!transitioned) {
+            val currentState = _viewState.value
+            if (!currentState.isAwaitingConnection() ||
+                expectedReadinessState != null &&
+                !currentState.matchesReadinessState(expectedReadinessState)
+            ) {
+                break
+            }
+            val contentState = FrontendViewState.Content(
+                serverId = currentState.serverId,
+                url = currentState.url,
+                serverHandleInsets = serverHandleInsets,
+                serverHandleTopInsets = serverHandleTopInsets,
+            )
+            if (_viewState.compareAndSet(currentState, contentState)) {
+                transitioned = true
             }
         }
-        if (wasAwaitingConnection) {
+        if (!transitioned) return
+        if (wasAwaitingConnection && transitioned) {
             // Remove any previous navigation
             _webViewActions.emit(WebViewAction.ClearHistory())
             checkSecurityVersion(_viewState.value.serverId)
