@@ -3,6 +3,7 @@ package io.homeassistant.companion.android.util
 import android.net.Uri
 import android.net.http.SslError
 import android.webkit.HttpAuthHandler
+import android.webkit.ValueCallback
 import android.webkit.WebResourceError
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -68,6 +69,9 @@ class HAWebViewClientTest {
             onPageFinished = null,
             onReceivedHttpAuthRequest = null,
             onSubresourceSslError = { subresourceSslErrorUrls += it },
+            isStandaloneResourceTarget = { url ->
+                url?.contains("/api/") == true || url?.contains("/local/") == true
+            },
         )
     }
 
@@ -88,6 +92,185 @@ class HAWebViewClientTest {
         client.onPageFinished(null, "http://homeassistant.local:80/onboarding")
 
         assertEquals("http://homeassistant.local:80/onboarding", finishedUrl)
+    }
+
+    @Nested
+    inner class StandaloneResourceReadiness {
+        private val evaluationCallback = slot<ValueCallback<String>>()
+        private val evaluatedScript = slot<String>()
+        private var readyUrls: Pair<String?, String?>? = null
+        private lateinit var client: HAWebViewClient
+        private lateinit var webView: WebView
+
+        private fun beginNavigation(startedUrl: String, finishedUrl: String, eligibleTarget: Boolean = true) {
+            currentUrlFlow.value = startedUrl
+            webView = mockk(relaxed = true) {
+                every { url } returns finishedUrl
+                every { evaluateJavascript(capture(evaluatedScript), capture(evaluationCallback)) } returns Unit
+            }
+            client = HAWebViewClient(
+                keyChainRepository = keyChainRepository,
+                clientCertProvider = clientCertProvider,
+                currentUrlFlow = currentUrlFlow,
+                onFrontendError = { capturedError = it },
+                onCrash = null,
+                onUrlIntercepted = null,
+                onPageFinished = null,
+                onReceivedHttpAuthRequest = null,
+                onStandaloneResourceReady = { source, final -> readyUrls = source to final },
+                isStandaloneResourceTarget = { eligibleTarget },
+            )
+            client.onPageStarted(webView, startedUrl, null)
+            client.onPageFinished(webView, finishedUrl)
+        }
+
+        private fun completeEvaluation(result: String) {
+            evaluationCallback.captured.onReceiveValue(result)
+        }
+
+        @Test
+        fun `Given successful 206 media response when main frame finishes then signals readiness`() {
+            val url = "https://example.com/api/camera.png"
+            beginNavigation(url, url)
+
+            completeEvaluation(
+                """{"status":206,"redirectCount":0,"redirectStart":0,"mime":"image/png","html":false,"mediaReady":true}""",
+            )
+
+            assertEquals(url to url, readyUrls)
+            assertTrue(evaluatedScript.captured.contains("responseStatus"))
+            assertTrue(evaluatedScript.captured.contains("redirectCount"))
+        }
+
+        @Test
+        fun `Given HTTP error response when main frame finishes then does not signal readiness`() {
+            val url = "https://example.com/api/error.json"
+            beginNavigation(url, url)
+
+            completeEvaluation(
+                """{"status":404,"redirectCount":0,"redirectStart":0,"mime":"application/json","html":false,"mediaReady":false}""",
+            )
+
+            assertEquals(null, readyUrls)
+        }
+
+        @Test
+        fun `Given unavailable status and decoded media when main frame finishes then signals guarded fallback`() {
+            val url = "https://example.com/local/camera.mp4"
+            beginNavigation(url, url)
+
+            completeEvaluation(
+                """{"status":0,"redirectCount":0,"redirectStart":0,"mime":"video/mp4","html":false,"mediaReady":true}""",
+            )
+
+            assertEquals(url to url, readyUrls)
+        }
+
+        @Test
+        fun `Given statusless media still loading when main frame finishes then reevaluates until decoded`() {
+            val url = "https://example.com/local/camera.mp4"
+            beginNavigation(url, url)
+            every { webView.postDelayed(any(), any()) } answers {
+                firstArg<Runnable>().run()
+                true
+            }
+
+            completeEvaluation(
+                """{"status":0,"redirectCount":0,"redirectStart":0,"mime":"video/mp4","html":false,"mediaReady":false,"mediaPending":true}""",
+            )
+            completeEvaluation(
+                """{"status":0,"redirectCount":0,"redirectStart":0,"mime":"video/mp4","html":false,"mediaReady":true,"mediaPending":false}""",
+            )
+
+            assertEquals(url to url, readyUrls)
+            verify(exactly = 2) { webView.evaluateJavascript(any(), any()) }
+        }
+
+        @Test
+        fun `Given unavailable status and JSON document when main frame finishes then does not signal fallback`() {
+            val url = "https://example.com/api/error.json"
+            beginNavigation(url, url)
+
+            completeEvaluation(
+                """{"status":0,"redirectCount":0,"redirectStart":0,"mime":"application/json","html":false,"mediaReady":false}""",
+            )
+
+            assertEquals(null, readyUrls)
+        }
+
+        @Test
+        fun `Given frontend HTML 200 when main frame finishes then leaves it to the frontend handshake`() {
+            val url = "https://example.com/api/hassio_ingress/token/"
+            beginNavigation(url, url)
+
+            completeEvaluation(
+                """{"status":200,"redirectCount":0,"redirectStart":0,"mime":"text/html","html":true,"mediaReady":false}""",
+            )
+
+            assertEquals(null, readyUrls)
+        }
+
+        @Test
+        fun `Given same-origin redirect to API media when main frame finishes then signals final readiness`() {
+            val startedUrl = "https://example.com/api/redirect"
+            val finishedUrl = "https://example.com/api/camera.mp4"
+            beginNavigation(startedUrl, finishedUrl)
+
+            completeEvaluation(
+                """{"status":200,"redirectCount":1,"redirectStart":2.5,"mime":"video/mp4","html":false,"mediaReady":true}""",
+            )
+
+            assertEquals(startedUrl to finishedUrl, readyUrls)
+        }
+
+        @Test
+        fun `Given same-origin redirect outside api to media when main frame finishes then signals final readiness`() {
+            val startedUrl = "https://example.com/api/download"
+            val finishedUrl = "https://example.com/media/camera.mp4"
+            beginNavigation(startedUrl, finishedUrl)
+
+            completeEvaluation(
+                """{"status":200,"redirectCount":1,"redirectStart":2.5,"mime":"video/mp4","html":false,"mediaReady":true}""",
+            )
+
+            assertEquals(startedUrl to finishedUrl, readyUrls)
+        }
+
+        @Test
+        fun `Given selected target outside api and local when main frame finishes then does not evaluate for standalone readiness`() {
+            val url = "https://example.com/dashboard"
+            beginNavigation(url, url, eligibleTarget = false)
+
+            assertEquals(null, readyUrls)
+            verify(exactly = 0) { webView.evaluateJavascript(any(), any()) }
+        }
+
+        @Test
+        fun `Given final document is off-origin when main frame finishes then does not signal readiness`() {
+            beginNavigation("https://example.com/api/redirect", "https://other.example/api/camera.mp4")
+
+            assertEquals(null, readyUrls)
+            verify(exactly = 0) { webView.evaluateJavascript(any(), any()) }
+        }
+
+        @Test
+        fun `Given a native main-frame HTTP error before asynchronous readiness result then readiness is invalidated`() {
+            val url = "https://example.com/api/camera.mp4"
+            beginNavigation(url, url)
+            val request = mockRequest(url)
+            val response = mockk<WebResourceResponse> {
+                every { statusCode } returns 404
+                every { reasonPhrase } returns "Not Found"
+            }
+            client.onReceivedHttpError(webView, request, response)
+
+            completeEvaluation(
+                """{"status":0,"redirectCount":0,"redirectStart":0,"mime":"video/mp4","html":false,"mediaReady":true}""",
+            )
+
+            assertEquals(null, readyUrls)
+            assertTrue(capturedError is FrontendConnectionError.Unknown)
+        }
     }
 
     @Test
@@ -258,6 +441,59 @@ class HAWebViewClientTest {
         }
 
         webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertEquals(null, capturedError)
+    }
+
+    @Test
+    fun `Given same-origin redirect main-frame HTTP error when received then emits error`() {
+        val selectedUrl = "http://homeassistant.local:8123/api/redirect"
+        val finalUrl = "http://homeassistant.local:8123/media/missing.mp4"
+        currentUrlFlow.value = selectedUrl
+        val webView = mockWebView()
+        every { webView.url } returns finalUrl
+        val request = mockRequest(finalUrl)
+        val response = mockk<WebResourceResponse> {
+            every { statusCode } returns 404
+            every { reasonPhrase } returns "Not Found"
+        }
+        webViewClient.onPageStarted(webView, selectedUrl, null)
+
+        webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertTrue(capturedError is FrontendConnectionError.Unknown)
+    }
+
+    @Test
+    fun `Given delayed main-frame error for a previous distinct URL then does not replace current load`() {
+        val previousUrl = "http://homeassistant.local:8123/api/previous"
+        val currentUrl = "http://homeassistant.local:8123/api/current"
+        currentUrlFlow.value = currentUrl
+        val webView = mockWebView()
+        every { webView.url } returns currentUrl
+        webViewClient.onPageStarted(webView, currentUrl, null)
+        val request = mockRequest(previousUrl)
+        val response = mockk<WebResourceResponse> {
+            every { statusCode } returns 404
+            every { reasonPhrase } returns "Not Found"
+        }
+
+        webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertEquals(null, capturedError)
+    }
+
+    @Test
+    fun `Given same-origin HTTP error for a subresource then does not emit main-frame error`() {
+        val currentUrl = "http://homeassistant.local:8123/api/states"
+        currentUrlFlow.value = currentUrl
+        val request = mockRequest(currentUrl, isForMainFrame = false)
+        val response = mockk<WebResourceResponse> {
+            every { statusCode } returns 500
+            every { reasonPhrase } returns "Server Error"
+        }
+
+        webViewClient.onReceivedHttpError(mockWebView(), request, response)
 
         assertEquals(null, capturedError)
     }
@@ -573,7 +809,8 @@ class HAWebViewClientTest {
         }
     }
 
-    private fun mockRequest(url: String) = mockk<android.webkit.WebResourceRequest> {
+    private fun mockRequest(url: String, isForMainFrame: Boolean = true) = mockk<android.webkit.WebResourceRequest> {
+        every { this@mockk.isForMainFrame } returns isForMainFrame
         every { this@mockk.url } returns mockk {
             every { this@mockk.toString() } returns url
         }

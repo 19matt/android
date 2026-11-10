@@ -24,6 +24,7 @@ import io.homeassistant.companion.android.common.data.keychain.KeyChainRepositor
 import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.prefs.ScreenOrientation
 import io.homeassistant.companion.android.common.data.prefs.ZoomSettings
+import io.homeassistant.companion.android.common.data.servers.ServerConnectionStateProvider
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.util.GestureDirection
 import io.homeassistant.companion.android.database.authentication.Authentication
@@ -223,6 +224,8 @@ class FrontendViewModelTest {
                     onReceivedHttpAuthRequest = any(),
                     onCanGoBackChanged = any(),
                     onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
                 )
             } answers {
                 // onUrlIntercepted is at parameter index 3 in HAWebViewClientFactory.create
@@ -1168,6 +1171,347 @@ class FrontendViewModelTest {
     }
 
     @Nested
+    inner class StandaloneResourceLoading {
+
+        private suspend fun createViewModelWithLoadCallbacks(
+            url: String,
+            path: String = url.substringAfter(".com"),
+            standaloneResourceTarget: Boolean = path.substringBefore('?')
+                .substringBefore('#')
+                .removePrefix("/")
+                .substringBefore('/') in setOf("api", "local"),
+        ): Triple<FrontendViewModel, (String?, String?) -> Unit, (FrontendConnectionError) -> Unit> {
+            var onStandaloneResourceReady: ((String?, String?) -> Unit)? = null
+            var onFrontendError: ((FrontendConnectionError) -> Unit)? = null
+            coEvery {
+                webViewClientFactory.create(
+                    currentUrlFlow = any(),
+                    onFrontendError = any(),
+                    onCrash = any(),
+                    onUrlIntercepted = any(),
+                    onPageFinished = any(),
+                    onReceivedHttpAuthRequest = any(),
+                    onCanGoBackChanged = any(),
+                    onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
+                )
+            } answers {
+                onFrontendError = arg(1)
+                onStandaloneResourceReady = arg(8)
+                mockk(relaxed = true)
+            }
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.Success(
+                    url = url,
+                    serverId = serverId,
+                    isStandaloneResourceTarget = standaloneResourceTarget,
+                ),
+            )
+
+            val viewModel = createViewModel(path = path)
+            viewModel.getWebViewClient()
+
+            return Triple(
+                viewModel,
+                { startedUrl, finishedUrl -> onStandaloneResourceReady!!.invoke(startedUrl, finishedUrl) },
+                { error -> onFrontendError!!.invoke(error) },
+            )
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = ["/api/states", "/local/media/camera.mp4"])
+        fun `Given successful same-origin api or local resource when main frame finishes then show content`(path: String) = runTest {
+            val url = "https://ha.example.com$path"
+            val callbacks = createViewModelWithLoadCallbacks(url, path)
+            runCurrent()
+
+            callbacks.second(url, url)
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+            assertEquals(url, state.url)
+        }
+
+        @Test
+        fun `Given configured base path when selected api target finishes then show content`() = runTest {
+            val targetPath = "/api/states"
+            val selectedUrl = "https://ha.example.com/ha/api/states?external_auth=1"
+            val callbacks = createViewModelWithLoadCallbacks(selectedUrl, targetPath)
+            runCurrent()
+
+            callbacks.second(selectedUrl, selectedUrl)
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+            assertEquals(selectedUrl, state.url)
+        }
+
+        @ParameterizedTest
+        @ValueSource(
+            strings = [
+                "https://ha.example.com/ha/api/states",
+                "https://ha.example.com/ha/local/media/camera.mp4",
+            ],
+        )
+        fun `Given same-origin absolute api or local target with a configured base path when ready then show content`(target: String) = runTest {
+            val selectedUrl = "$target?external_auth=1"
+            val callbacks = createViewModelWithLoadCallbacks(selectedUrl, target, standaloneResourceTarget = true)
+            runCurrent()
+
+            callbacks.second(selectedUrl, selectedUrl)
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+            assertEquals(selectedUrl, state.url)
+        }
+
+        @Test
+        fun `Given absolute nested api path outside configured base when ready then keep loading`() = runTest {
+            val target = "https://ha.example.com/foo/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(target, target, standaloneResourceTarget = false)
+            runCurrent()
+
+            callbacks.second(target, target)
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Loading::class.java, callbacks.first.viewState.value)
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = ["/apiary/states", "/locality/media/video.mp4"])
+        fun `Given path with api or local prefix when main frame is ready then keep loading`(path: String) = runTest {
+            val url = "https://ha.example.com$path"
+            val callbacks = createViewModelWithLoadCallbacks(url, path)
+            runCurrent()
+
+            callbacks.second(url, url)
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Loading::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given default dashboard target on api path when main frame is ready then keep frontend handshake loading`() = runTest {
+            val url = "https://ha.example.com/api/"
+            val callbacks = createViewModelWithLoadCallbacks(url, path = "")
+            runCurrent()
+
+            callbacks.second(url, url)
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Loading::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given off-origin api url when main frame is ready then keep loading`() = runTest {
+            val selectedUrl = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(selectedUrl, "/api/states")
+            runCurrent()
+
+            callbacks.second(selectedUrl, "https://other.example.com/api/states")
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Loading::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given same-origin redirect within api segment when main frame is ready then show content`() = runTest {
+            val selectedUrl = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(selectedUrl, "/api/states")
+            runCurrent()
+
+            callbacks.second(selectedUrl, "https://ha.example.com/api/redirected")
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given same-origin media redirect outside api or local when client confirms readiness then show content`() = runTest {
+            val selectedUrl = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(selectedUrl, "/api/states")
+            runCurrent()
+
+            callbacks.second(selectedUrl, "https://ha.example.com/media/camera.mp4")
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given page finished before a delayed HTTP error when error arrives then show the real error`() = runTest {
+            val url = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(url, "/api/states")
+            runCurrent()
+
+            callbacks.second(url, url)
+            runCurrent()
+            val stateAfterPageFinished = callbacks.first.viewState.value
+
+            callbacks.third(
+                FrontendConnectionError.Unknown(
+                    errorDetails = "HTTP 503 Service Unavailable",
+                    rawErrorType = "WebResourceResponse",
+                ),
+            )
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Error::class.java, callbacks.first.viewState.value)
+            assertInstanceOf(FrontendConnectionError.Unknown::class.java, state.error)
+            callbacks.second(url, url)
+            runCurrent()
+            assertInstanceOf(FrontendViewState.Error::class.java, callbacks.first.viewState.value)
+            assertInstanceOf(FrontendViewState.Content::class.java, stateAfterPageFinished)
+        }
+
+        @Test
+        fun `Given an HTTP error callback before asynchronous readiness then keep the error state`() = runTest {
+            val url = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(url, "/api/states")
+            runCurrent()
+
+            callbacks.third(
+                FrontendConnectionError.Unknown(
+                    errorDetails = "HTTP 404 Not Found",
+                    rawErrorType = "WebResourceResponse",
+                ),
+            )
+            callbacks.second(url, url)
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Error::class.java, callbacks.first.viewState.value)
+            assertInstanceOf(FrontendConnectionError.Unknown::class.java, state.error)
+        }
+
+        @Test
+        fun `Given frontend timeout followed by confirmed standalone resource readiness then show content`() = runTest {
+            val url = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(url, "/api/states")
+            runCurrent()
+
+            advanceTimeBy(CONNECTION_TIMEOUT)
+            runCurrent()
+            val timeoutState = assertInstanceOf(FrontendViewState.Error::class.java, callbacks.first.viewState.value)
+            assertEquals(FrontendConnectionError.ExternalBusTimeout, timeoutState.error)
+
+            callbacks.second(url, url)
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given readiness while timeout connection resolution is suspended then do not overwrite content`() = runTest {
+            val url = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(url, "/api/states")
+            val connectionResolution = kotlinx.coroutines.CompletableDeferred<Unit>()
+            coEvery { serverManager.connectionStateProvider(serverId) } coAnswers {
+                connectionResolution.await()
+                mockk<ServerConnectionStateProvider>(relaxed = true)
+            }
+            runCurrent()
+
+            advanceTimeBy(CONNECTION_TIMEOUT)
+            runCurrent()
+            assertInstanceOf(FrontendViewState.Loading::class.java, callbacks.first.viewState.value)
+
+            callbacks.second(url, url)
+            runCurrent()
+            assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+
+            connectionResolution.complete(Unit)
+            runCurrent()
+
+            assertInstanceOf(FrontendViewState.Content::class.java, callbacks.first.viewState.value)
+        }
+
+        @Test
+        fun `Given native error while readiness awaits server metadata then preserve the error`() = runTest {
+            val url = "https://ha.example.com/api/states"
+            val callbacks = createViewModelWithLoadCallbacks(url, "/api/states")
+            val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+            var suspendFirstServerRead = true
+            coEvery { serverManager.getServer(any<Int>()) } coAnswers {
+                if (suspendFirstServerRead) {
+                    suspendFirstServerRead = false
+                    gate.await()
+                }
+                null
+            }
+            runCurrent()
+
+            callbacks.second(url, url)
+            runCurrent()
+            callbacks.third(
+                FrontendConnectionError.Unknown(
+                    errorDetails = "HTTP 503 Service Unavailable",
+                    rawErrorType = "WebResourceResponse",
+                ),
+            )
+            runCurrent()
+            gate.complete(Unit)
+            runCurrent()
+
+            val state = assertInstanceOf(FrontendViewState.Error::class.java, callbacks.first.viewState.value)
+            assertInstanceOf(FrontendConnectionError.Unknown::class.java, state.error)
+        }
+
+        @Test
+        fun `Given a distinct-URL retry when the previous URL finishes late then keep the current resource content`() = runTest {
+            val oldUrl = "https://ha.example.com/api/old"
+            val currentUrl = "https://ha.example.com/local/current.mp4"
+            val results = MutableSharedFlow<UrlLoadResult>(replay = 1)
+            results.emit(UrlLoadResult.Success(url = oldUrl, serverId = serverId))
+            every { urlManager.serverUrlFlow(any(), any()) } returns results
+
+            var onStandaloneResourceReady: ((String?, String?) -> Unit)? = null
+            coEvery {
+                webViewClientFactory.create(
+                    currentUrlFlow = any(),
+                    onFrontendError = any(),
+                    onCrash = any(),
+                    onUrlIntercepted = any(),
+                    onPageFinished = any(),
+                    onReceivedHttpAuthRequest = any(),
+                    onCanGoBackChanged = any(),
+                    onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
+                )
+            } answers {
+                onStandaloneResourceReady = arg(8)
+                mockk(relaxed = true)
+            }
+
+            val viewModel = createViewModel(path = "/api/old")
+            viewModel.getWebViewClient()
+            runCurrent()
+            results.emit(
+                UrlLoadResult.Success(
+                    url = currentUrl,
+                    serverId = serverId + 1,
+                    isStandaloneResourceTarget = true,
+                ),
+            )
+            runCurrent()
+
+            onStandaloneResourceReady!!.invoke(currentUrl, currentUrl)
+            runCurrent()
+            val stateAfterCurrentFinish = viewModel.viewState.value
+
+            onStandaloneResourceReady!!.invoke(oldUrl, oldUrl)
+            runCurrent()
+
+            val finalState = assertInstanceOf(FrontendViewState.Content::class.java, viewModel.viewState.value)
+            assertEquals(currentUrl, finalState.url)
+            assertEquals(serverId + 1, finalState.serverId)
+            val currentState = assertInstanceOf(FrontendViewState.Content::class.java, stateAfterCurrentFinish)
+            assertEquals(currentUrl, currentState.url)
+        }
+    }
+
+    @Nested
     inner class SecurityLevel {
 
         @Test
@@ -1391,6 +1735,8 @@ class FrontendViewModelTest {
                     onReceivedHttpAuthRequest = any(),
                     onCanGoBackChanged = any(),
                     onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
                 )
             } answers {
                 // onPageFinished is at parameter index 4 in HAWebViewClientFactory.create
@@ -1529,6 +1875,8 @@ class FrontendViewModelTest {
                     onReceivedHttpAuthRequest = any(),
                     onCanGoBackChanged = any(),
                     onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
                 )
             } answers {
                 capturedCallback = arg(5)
@@ -1633,6 +1981,8 @@ class FrontendViewModelTest {
                     onReceivedHttpAuthRequest = any(),
                     onCanGoBackChanged = any(),
                     onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
                 )
             } answers {
                 // onSubresourceSslError is at parameter index 7 in HAWebViewClientFactory.create
@@ -1695,6 +2045,8 @@ class FrontendViewModelTest {
                     onReceivedHttpAuthRequest = any(),
                     onCanGoBackChanged = any(),
                     onSubresourceSslError = any(),
+                    onStandaloneResourceReady = any(),
+                    isStandaloneResourceTarget = any(),
                 )
             } answers {
                 // onCanGoBackChanged is at parameter index 6 in HAWebViewClientFactory.create
